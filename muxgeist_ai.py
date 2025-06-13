@@ -87,9 +87,11 @@ class DaemonClient:
         # Parse the response
         lines = response.strip().split("\n")
         context_data = {}
+        scrollback_lines = []
+        parsing_scrollback = False
 
         for line in lines:
-            if ":" in line:
+            if ":" in line and not parsing_scrollback:
                 key, value = line.split(":", 1)
                 key = key.strip().lower()
                 value = value.strip()
@@ -104,9 +106,36 @@ class DaemonClient:
                     context_data["last_activity"] = int(value)
                 elif key == "scrollback length":
                     context_data["scrollback_length"] = int(value)
+                elif key == "scrollback":
+                    parsing_scrollback = True
+                    if value:  # If there's content on same line
+                        scrollback_lines.append(value)
+            elif parsing_scrollback:
+                scrollback_lines.append(line)
 
-        # Get actual scrollback content (simplified for now)
-        context_data["scrollback"] = ""  # TODO: Get from daemon
+        # Join scrollback content
+        context_data["scrollback"] = "\n".join(scrollback_lines)
+
+        # Get actual scrollback from tmux if not in daemon response
+        if not context_data.get("scrollback") and context_data.get("session_id"):
+            try:
+                import subprocess
+
+                result = subprocess.run(
+                    ["tmux", "capture-pane", "-t", context_data["session_id"], "-p"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if result.returncode == 0:
+                    context_data["scrollback"] = result.stdout
+                    context_data["scrollback_length"] = len(result.stdout)
+                    logger.info(
+                        f"Retrieved scrollback directly from tmux ({len(result.stdout)} chars)"
+                    )
+            except Exception as e:
+                logger.warning(f"Could not get scrollback from tmux: {e}")
+                context_data["scrollback"] = ""
 
         return SessionContext(**context_data)
 
@@ -242,13 +271,29 @@ class AIClient:
             if not api_key:
                 raise ValueError("ANTHROPIC_API_KEY environment variable required")
             self.client = Anthropic(api_key=api_key)
+            self.model = "claude-3-5-sonnet-20241022"
+
         elif provider == "openai":
             api_key = os.getenv("OPENAI_API_KEY")
             if not api_key:
                 raise ValueError("OPENAI_API_KEY environment variable required")
             self.client = openai.OpenAI(api_key=api_key)
+            self.model = "gpt-4o"
+
+        elif provider == "openrouter":
+            api_key = os.getenv("OPENROUTER_API_KEY")
+            if not api_key:
+                raise ValueError("OPENROUTER_API_KEY environment variable required")
+            self.client = openai.OpenAI(
+                api_key=api_key, base_url="https://openrouter.ai/api/v1"
+            )
+            # Default to a good model, but allow override via env var
+            self.model = os.getenv("OPENROUTER_MODEL", "anthropic/claude-3.5-sonnet")
+
         else:
-            raise ValueError(f"Unsupported provider: {provider}")
+            raise ValueError(
+                f"Unsupported provider: {provider}. Use 'anthropic', 'openai', or 'openrouter'"
+            )
 
     def analyze_context(
         self,
@@ -266,15 +311,15 @@ class AIClient:
         try:
             if self.provider == "anthropic":
                 response = self.client.messages.create(
-                    model="claude-3-sonnet-20240229",
+                    model=self.model,
                     max_tokens=1000,
                     messages=[{"role": "user", "content": prompt}],
                 )
                 return response.content[0].text
 
-            elif self.provider == "openai":
+            elif self.provider in ["openai", "openrouter"]:
                 response = self.client.chat.completions.create(
-                    model="gpt-4",
+                    model=self.model,
                     max_tokens=1000,
                     messages=[{"role": "user", "content": prompt}],
                 )
@@ -322,10 +367,30 @@ Keep responses concise and terminal-friendly. Focus on being helpful, not verbos
 class MuxgeistAI:
     """Main AI service for Muxgeist"""
 
-    def __init__(self, ai_provider: str = "anthropic"):
+    def __init__(self, ai_provider: str = None):
         self.daemon_client = DaemonClient()
         self.context_analyzer = ContextAnalyzer()
+
+        # Auto-detect provider if not specified
+        if ai_provider is None:
+            ai_provider = self._detect_provider()
+
         self.ai_client = AIClient(ai_provider)
+        logger.info(
+            f"Initialized with {ai_provider} provider using model: {self.ai_client.model}"
+        )
+
+    def _detect_provider(self) -> str:
+        """Auto-detect available AI provider"""
+        if os.getenv("ANTHROPIC_API_KEY"):
+            return "anthropic"
+        elif os.getenv("OPENROUTER_API_KEY"):
+            return "openrouter"
+        elif os.getenv("OPENAI_API_KEY"):
+            return "openai"
+        else:
+            # Default to anthropic, will fail gracefully if no key
+            return "anthropic"
 
     def analyze_session(self, session_id: str) -> Optional[AnalysisResult]:
         """Perform complete analysis of a session"""
@@ -391,13 +456,51 @@ class MuxgeistAI:
 
 def main():
     """Test the AI service"""
-    if len(sys.argv) != 2:
-        print("Usage: python3 muxgeist_ai.py <session_name>")
-        print("       python3 muxgeist_ai.py --list")
+    if len(sys.argv) < 2:
+        print(
+            "Usage: python3 muxgeist_ai.py <session_name> [--provider anthropic|openai|openrouter]"
+        )
+        print(
+            "       python3 muxgeist_ai.py --list [--provider anthropic|openai|openrouter]"
+        )
+        print("       python3 muxgeist_ai.py --providers")
         sys.exit(1)
 
+    # Parse arguments
+    provider = None
+    if "--provider" in sys.argv:
+        provider_index = sys.argv.index("--provider")
+        if provider_index + 1 < len(sys.argv):
+            provider = sys.argv[provider_index + 1]
+            # Remove provider args from sys.argv for simpler processing
+            sys.argv.pop(provider_index + 1)
+            sys.argv.pop(provider_index)
+
     try:
-        ai_service = MuxgeistAI()
+        # Handle special commands
+        if sys.argv[1] == "--providers":
+            print("Available AI providers:")
+            providers = []
+            if os.getenv("ANTHROPIC_API_KEY"):
+                providers.append("✓ anthropic (Claude)")
+            else:
+                providers.append("✗ anthropic (missing ANTHROPIC_API_KEY)")
+
+            if os.getenv("OPENAI_API_KEY"):
+                providers.append("✓ openai (GPT)")
+            else:
+                providers.append("✗ openai (missing OPENAI_API_KEY)")
+
+            if os.getenv("OPENROUTER_API_KEY"):
+                providers.append("✓ openrouter (Multiple models)")
+            else:
+                providers.append("✗ openrouter (missing OPENROUTER_API_KEY)")
+
+            for p in providers:
+                print(f"  {p}")
+            return
+
+        ai_service = MuxgeistAI(provider)
 
         if sys.argv[1] == "--list":
             print(ai_service.get_session_summary())
@@ -406,10 +509,13 @@ def main():
             result = ai_service.analyze_session(session_name)
 
             if result:
-                print(f"\n🌟 Muxgeist Analysis for '{session_name}'")
+                print(
+                    f"\n🌟 Muxgeist Analysis for '{session_name}' (via {ai_service.ai_client.provider})"
+                )
                 print("=" * 50)
                 print(result.analysis)
-                print(f"\nConfidence: {result.confidence:.1%}")
+                print(f"\nModel: {ai_service.ai_client.model}")
+                print(f"Confidence: {result.confidence:.1%}")
                 if result.requires_attention:
                     print("⚠️  Requires attention")
             else:
@@ -417,6 +523,16 @@ def main():
 
     except Exception as e:
         logger.error(f"Error: {e}")
+        print(f"\n❌ Error: {e}")
+
+        # Provide helpful hints for common errors
+        if "API key" in str(e):
+            print("\n💡 Tip: Set your API key:")
+            print("  export ANTHROPIC_API_KEY='your-key'")
+            print("  export OPENAI_API_KEY='your-key'")
+            print("  export OPENROUTER_API_KEY='your-key'")
+            print("\nOr check available providers with: --providers")
+
         sys.exit(1)
 
 
