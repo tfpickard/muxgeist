@@ -1,4 +1,6 @@
 muxgeist-daemon
 muxgeist-client
 *.dSYM/
-__pycache__/
+_ _pycache__/
+.venv
+.env

@@ -1,0 +1,179 @@
+#!/bin/bash
+
+# Muxgeist summoning script
+# This script creates or shows the Muxgeist pane
+
+set -e
+
+# Configuration
+MUXGEIST_PANE_TITLE="muxgeist"
+MUXGEIST_SIZE="40" # Percentage of screen width
+MUXGEIST_SCRIPT_PATH="$(dirname "$0")/muxgeist-interactive.py"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+[[ -f ~/.muxgeist.env ]] && source ~/.muxgeist.env ||
+    echo "No ~/.muxgeist.env file found. Things might not."
+log_error() {
+    echo -e "${RED}❌ $1${NC}" >&2
+}
+
+log_success() {
+    echo -e "${GREEN}✅ $1${NC}" >&2
+}
+
+log_info() {
+    echo -e "${YELLOW}🌟 $1${NC}" >&2
+}
+
+# Check if we're in tmux
+if [ -z "$TMUX" ]; then
+    log_error "Must be run from within tmux"
+    exit 1
+fi
+
+# Get current session and window
+CURRENT_SESSION=$(tmux display-message -p '#{session_name}')
+CURRENT_WINDOW=$(tmux display-message -p '#{window_index}')
+
+# Function to find Muxgeist pane
+find_muxgeist_pane() {
+    tmux list-panes -t "$CURRENT_SESSION:$CURRENT_WINDOW" -F '#{pane_index} #{pane_title}' |
+        grep "$MUXGEIST_PANE_TITLE" |
+        cut -d' ' -f1
+}
+
+# Function to check if Muxgeist pane exists
+muxgeist_exists() {
+    [ -n "$(find_muxgeist_pane)" ]
+}
+
+# Function to check if Muxgeist pane is visible
+muxgeist_visible() {
+    local pane_id=$(find_muxgeist_pane)
+    if [ -n "$pane_id" ]; then
+        local width=$(tmux display-message -t "$pane_id" -p '#{pane_width}')
+        [ "$width" -gt 5 ] # Consider visible if width > 5
+    else
+        return 1
+    fi
+}
+
+# Function to create Muxgeist pane
+create_muxgeist_pane() {
+    log_info "Summoning Muxgeist..."
+
+    # Check if the interactive script exists
+    if [ ! -f "$MUXGEIST_SCRIPT_PATH" ]; then
+        log_error "Muxgeist script not found: $MUXGEIST_SCRIPT_PATH"
+        exit 1
+    fi
+
+    # Create the pane
+    tmux split-window -h -p "$MUXGEIST_SIZE" \
+        "printf '\\033]2;$MUXGEIST_PANE_TITLE\\033\\\\'; python3 '$MUXGEIST_SCRIPT_PATH'"
+
+    # Get the new pane ID and set its title
+    local new_pane=$(tmux display-message -p '#{pane_index}')
+
+    # Focus back to original pane
+    tmux last-pane
+
+    log_success "Muxgeist summoned in pane $new_pane"
+}
+
+# Function to show hidden Muxgeist pane
+show_muxgeist_pane() {
+    local pane_id=$(find_muxgeist_pane)
+
+    log_info "Showing Muxgeist pane..."
+
+    # Resize the pane to make it visible
+    tmux resize-pane -t "$pane_id" -x "${MUXGEIST_SIZE}%"
+
+    # Refresh the display
+    tmux refresh-client
+
+    log_success "Muxgeist is now visible"
+}
+
+# Function to hide Muxgeist pane
+hide_muxgeist_pane() {
+    local pane_id=$(find_muxgeist_pane)
+
+    log_info "Hiding Muxgeist pane..."
+
+    # Resize to minimal width (effectively hiding)
+    tmux resize-pane -t "$pane_id" -x 1
+
+    # Focus back to main pane
+    tmux select-pane -t 0
+
+    log_success "Muxgeist hidden"
+}
+
+# Main logic
+main() {
+    if muxgeist_exists; then
+        if muxgeist_visible; then
+            # Muxgeist is visible, hide it
+            hide_muxgeist_pane
+        else
+            # Muxgeist exists but hidden, show it
+            show_muxgeist_pane
+        fi
+    else
+        # Muxgeist doesn't exist, create it
+        create_muxgeist_pane
+    fi
+}
+
+# Handle command line arguments
+case "${1:-}" in
+--create)
+    create_muxgeist_pane
+    ;;
+--show)
+    if muxgeist_exists; then
+        show_muxgeist_pane
+    else
+        log_error "Muxgeist pane doesn't exist"
+        exit 1
+    fi
+    ;;
+--hide)
+    if muxgeist_exists; then
+        hide_muxgeist_pane
+    else
+        log_error "Muxgeist pane doesn't exist"
+        exit 1
+    fi
+    ;;
+--toggle | "")
+    main
+    ;;
+--help | -h)
+    echo "Muxgeist Summoning Script"
+    echo ""
+    echo "Usage: $0 [option]"
+    echo ""
+    echo "Options:"
+    echo "  --create    Create new Muxgeist pane"
+    echo "  --show      Show hidden Muxgeist pane"
+    echo "  --hide      Hide visible Muxgeist pane"
+    echo "  --toggle    Toggle visibility (default)"
+    echo "  --help      Show this help"
+    echo ""
+    echo "Keybindings (add to ~/.tmux.conf):"
+    echo "  bind-key C-g run-shell 'muxgeist-summon'"
+    ;;
+*)
+    log_error "Unknown option: $1"
+    echo "Use --help for usage information"
+    exit 1
+    ;;
+esac
