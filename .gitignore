@@ -1,0 +1,4 @@
+muxgeist-daemon
+muxgeist-client
+*.dSYM/
+__pycache__/
