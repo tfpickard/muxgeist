@@ -8,7 +8,24 @@ set -e
 # Configuration
 MUXGEIST_PANE_TITLE="muxgeist"
 MUXGEIST_SIZE="40" # Percentage of screen width
-MUXGEIST_SCRIPT_PATH="$(dirname "$0")/muxgeist-interactive.py"
+
+# Try to find the interactive script in several locations
+SCRIPT_LOCATIONS=(
+    "$(dirname "$0")/muxgeist-interactive" # Wrapper script (preferred)
+    "$(which muxgeist-interactive 2>/dev/null || true)"
+    "$(dirname "$0")/muxgeist-interactive.py" # Direct Python script
+    "$HOME/.local/bin/muxgeist-interactive"
+    "$HOME/.local/bin/muxgeist-interactive.py"
+    "./muxgeist-interactive.py"
+)
+
+MUXGEIST_SCRIPT_PATH=""
+for location in "${SCRIPT_LOCATIONS[@]}"; do
+    if [ -f "$location" ] && [ -x "$location" ]; then
+        MUXGEIST_SCRIPT_PATH="$location"
+        break
+    fi
+done
 
 # Colors for output
 RED='\033[0;31m'
@@ -16,19 +33,34 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-[[ -f ~/.muxgeist.env ]] && source ~/.muxgeist.env ||
-    echo "No ~/.muxgeist.env file found. Things might not."
+# Debug log file
+DEBUG_LOG="$HOME/.config/muxgeist/summon.log"
+mkdir -p "$(dirname "$DEBUG_LOG")"
+
+log_debug() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >>"$DEBUG_LOG"
+}
+
 log_error() {
     echo -e "${RED}❌ $1${NC}" >&2
+    log_debug "ERROR: $1"
 }
 
 log_success() {
     echo -e "${GREEN}✅ $1${NC}" >&2
+    log_debug "SUCCESS: $1"
 }
 
 log_info() {
     echo -e "${YELLOW}🌟 $1${NC}" >&2
+    log_debug "INFO: $1"
 }
+
+log_debug "Starting muxgeist-summon"
+
+# Load environment if available
+[[ -f ~/.muxgeist.env ]] && source ~/.muxgeist.env
+[[ -f ~/.config/muxgeist/config.yaml ]] && log_debug "Config file exists"
 
 # Check if we're in tmux
 if [ -z "$TMUX" ]; then
@@ -39,6 +71,8 @@ fi
 # Get current session and window
 CURRENT_SESSION=$(tmux display-message -p '#{session_name}')
 CURRENT_WINDOW=$(tmux display-message -p '#{window_index}')
+
+log_debug "Current session: $CURRENT_SESSION, window: $CURRENT_WINDOW"
 
 # Function to find Muxgeist pane
 find_muxgeist_pane() {
@@ -63,27 +97,132 @@ muxgeist_visible() {
     fi
 }
 
+# Function to test the interactive script
+test_interactive_script() {
+    if [ -z "$MUXGEIST_SCRIPT_PATH" ]; then
+        log_error "Muxgeist interactive script not found"
+        log_error "Searched in:"
+        for location in "${SCRIPT_LOCATIONS[@]}"; do
+            log_error "  $location"
+        done
+        return 1
+    fi
+
+    log_debug "Found script at: $MUXGEIST_SCRIPT_PATH"
+
+    # Test if the script can run (different test for wrapper vs direct python)
+    if [[ "$MUXGEIST_SCRIPT_PATH" == *".py" ]]; then
+        # Direct Python script - test imports
+        if ! python3 -c "
+import sys
+sys.path.insert(0, '$(dirname "$MUXGEIST_SCRIPT_PATH")')
+try:
+    from muxgeist_ai import MuxgeistAI
+    print('✓ Dependencies OK')
+except ImportError as e:
+    print(f'✗ Import error: {e}')
+    sys.exit(1)
+" 2>/dev/null; then
+            log_error "Interactive script dependencies not available"
+            log_error "Run: make install-deps  or  pip3 install --user -r requirements.txt"
+            return 1
+        fi
+    else
+        # Wrapper script - check if it's executable and has proper shebang
+        if [ ! -x "$MUXGEIST_SCRIPT_PATH" ]; then
+            log_error "Wrapper script is not executable"
+            chmod +x "$MUXGEIST_SCRIPT_PATH" 2>/dev/null || true
+        fi
+
+        # Check if it has a bash shebang
+        if ! head -n1 "$MUXGEIST_SCRIPT_PATH" | grep -q "#!/bin/bash"; then
+            log_error "Wrapper script missing bash shebang"
+            return 1
+        fi
+
+        # Test if it can show help (quick validation)
+        if ! timeout 5 bash "$MUXGEIST_SCRIPT_PATH" --help >/dev/null 2>&1; then
+            log_error "Wrapper script cannot execute properly"
+            log_error "Try: make install  to fix installation"
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
 # Function to create Muxgeist pane
 create_muxgeist_pane() {
     log_info "Summoning Muxgeist..."
 
-    # Check if the interactive script exists
-    if [ ! -f "$MUXGEIST_SCRIPT_PATH" ]; then
-        log_error "Muxgeist script not found: $MUXGEIST_SCRIPT_PATH"
+    # Test the script first
+    if ! test_interactive_script; then
         exit 1
     fi
 
-    # Create the pane
-    tmux split-window -h -p "$MUXGEIST_SIZE" \
-        "printf '\\033]2;$MUXGEIST_PANE_TITLE\\033\\\\'; python3 '$MUXGEIST_SCRIPT_PATH'"
+    # Create a wrapper script that handles errors better
+    WRAPPER_SCRIPT=$(mktemp)
+    cat >"$WRAPPER_SCRIPT" <<EOF
+#!/bin/bash
+# Temporary wrapper for muxgeist interactive
 
-    # Get the new pane ID and set its title
-    local new_pane=$(tmux display-message -p '#{pane_index}')
+# Set the pane title
+printf '\\033]2;$MUXGEIST_PANE_TITLE\\033\\\\'
 
-    # Focus back to original pane
-    tmux last-pane
+# Determine how to execute the script
+if [[ "$MUXGEIST_SCRIPT_PATH" == *".py" ]]; then
+    # Direct Python script
+    cd "$(dirname "$MUXGEIST_SCRIPT_PATH")"
+    if ! python3 "$MUXGEIST_SCRIPT_PATH"; then
+        echo "❌ Muxgeist Python script failed"
+    fi
+else
+    # Wrapper script - execute with bash explicitly
+    if ! bash "$MUXGEIST_SCRIPT_PATH"; then
+        echo "❌ Muxgeist wrapper script failed"
+    fi
+fi
 
-    log_success "Muxgeist summoned in pane $new_pane"
+if [ \$? -ne 0 ]; then
+    echo "Check log: ~/.config/muxgeist/interactive.log"
+    echo "Debug log: $DEBUG_LOG"
+    echo ""
+    echo "Troubleshooting:"
+    echo "• Make sure daemon is running: ./muxgeist-daemon &"
+    echo "• Check dependencies: make install-deps"
+    echo "• Test setup: ./muxgeist-summon --test"
+    echo "• Check wrapper permissions: ls -la $MUXGEIST_SCRIPT_PATH"
+    echo ""
+    echo "Press Enter to close this pane..."
+    read
+fi
+EOF
+    chmod +x "$WRAPPER_SCRIPT"
+
+    log_debug "Created wrapper script: $WRAPPER_SCRIPT"
+
+    # Create the pane with the wrapper
+    if tmux split-window -h -p "$MUXGEIST_SIZE" "$WRAPPER_SCRIPT"; then
+        # Get the new pane ID
+        local new_pane=$(tmux display-message -p '#{pane_index}')
+        log_debug "Created pane: $new_pane"
+
+        # Focus back to original pane after a short delay
+        sleep 0.5
+        tmux last-pane
+
+        log_success "Muxgeist summoned in pane $new_pane"
+
+        # Clean up wrapper after a delay (in background)
+        (
+            sleep 10
+            rm -f "$WRAPPER_SCRIPT"
+        ) &
+    else
+        log_error "Failed to create tmux pane"
+        rm -f "$WRAPPER_SCRIPT"
+        exit 1
+    fi
 }
 
 # Function to show hidden Muxgeist pane
@@ -153,6 +292,79 @@ case "${1:-}" in
         exit 1
     fi
     ;;
+--test)
+    log_info "Testing Muxgeist setup..."
+    if test_interactive_script; then
+        log_success "Setup looks good!"
+    else
+        log_error "Setup has issues - check above"
+    fi
+    ;;
+--fix)
+    log_info "Attempting to fix wrapper script..."
+    if [ -n "$MUXGEIST_SCRIPT_PATH" ] && [ -f "$MUXGEIST_SCRIPT_PATH" ]; then
+        # Check if it's a wrapper script (not .py)
+        if [[ "$MUXGEIST_SCRIPT_PATH" != *".py" ]]; then
+            echo "Current script content:"
+            head -n5 "$MUXGEIST_SCRIPT_PATH"
+            echo ""
+
+            # Check if it has proper shebang
+            if ! head -n1 "$MUXGEIST_SCRIPT_PATH" | grep -q "#!/bin/bash"; then
+                log_info "Fixing missing bash shebang..."
+
+                # Create a backup
+                cp "$MUXGEIST_SCRIPT_PATH" "${MUXGEIST_SCRIPT_PATH}.backup"
+
+                # Recreate with proper shebang
+                temp_file=$(mktemp)
+                echo "#!/bin/bash" >"$temp_file"
+                echo "# Muxgeist Interactive wrapper script" >>"$temp_file"
+                echo "SCRIPT_DIR=\"\$(cd \"\$(dirname \"\$0\")\" && pwd)\"" >>"$temp_file"
+                echo "VENV_DIR=\"\$(dirname \"\$SCRIPT_DIR\")/share/muxgeist/venv\"" >>"$temp_file"
+                echo "if [ -f \"\$VENV_DIR/bin/python\" ]; then" >>"$temp_file"
+                echo "    exec \"\$VENV_DIR/bin/python\" \"\$SCRIPT_DIR/muxgeist-interactive.py\" \"\$@\"" >>"$temp_file"
+                echo "else" >>"$temp_file"
+                echo "    exec python3 \"\$SCRIPT_DIR/muxgeist-interactive.py\" \"\$@\"" >>"$temp_file"
+                echo "fi" >>"$temp_file"
+
+                mv "$temp_file" "$MUXGEIST_SCRIPT_PATH"
+                chmod +x "$MUXGEIST_SCRIPT_PATH"
+
+                log_success "Fixed wrapper script"
+                echo "New content:"
+                head -n5 "$MUXGEIST_SCRIPT_PATH"
+            else
+                log_success "Wrapper script looks correct"
+            fi
+        else
+            log_info "Script is a Python file, no wrapper fix needed"
+        fi
+    else
+        log_error "No script found to fix"
+    fi
+    ;;
+--debug)
+    log_info "Debug information:"
+    echo "Script path: $MUXGEIST_SCRIPT_PATH"
+    echo "Current session: $CURRENT_SESSION"
+    echo "Debug log: $DEBUG_LOG"
+    echo "TMUX: $TMUX"
+
+    if [ -n "$MUXGEIST_SCRIPT_PATH" ]; then
+        echo ""
+        echo "Script details:"
+        echo "  File: $MUXGEIST_SCRIPT_PATH"
+        echo "  Exists: $([ -f "$MUXGEIST_SCRIPT_PATH" ] && echo "Yes" || echo "No")"
+        echo "  Executable: $([ -x "$MUXGEIST_SCRIPT_PATH" ] && echo "Yes" || echo "No")"
+        echo "  First line: $(head -n1 "$MUXGEIST_SCRIPT_PATH" 2>/dev/null || echo "Cannot read")"
+        echo ""
+        echo "Script content (first 10 lines):"
+        head -n10 "$MUXGEIST_SCRIPT_PATH" 2>/dev/null || echo "Cannot read file"
+    fi
+
+    test_interactive_script
+    ;;
 --toggle | "")
     main
     ;;
@@ -166,10 +378,15 @@ case "${1:-}" in
     echo "  --show      Show hidden Muxgeist pane"
     echo "  --hide      Hide visible Muxgeist pane"
     echo "  --toggle    Toggle visibility (default)"
+    echo "  --test      Test setup"
+    echo "  --debug     Show debug information"
+    echo "  --fix       Fix wrapper script issues"
     echo "  --help      Show this help"
     echo ""
     echo "Keybindings (add to ~/.tmux.conf):"
     echo "  bind-key C-g run-shell 'muxgeist-summon'"
+    echo ""
+    echo "Debug log: $DEBUG_LOG"
     ;;
 *)
     log_error "Unknown option: $1"
@@ -177,3 +394,5 @@ case "${1:-}" in
     exit 1
     ;;
 esac
+
+log_debug "muxgeist-summon completed"

@@ -7,12 +7,14 @@ import os
 import sys
 import time
 import logging
+import yaml
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
 import openai
+import yaml
 from anthropic import Anthropic
 
 # Configure logging
@@ -41,11 +43,118 @@ class AnalysisResult:
     requires_attention: bool
 
 
+class ConfigManager:
+    """Manages configuration from YAML file and environment variables"""
+
+    def __init__(self):
+        self.config_dir = Path.home() / ".config" / "muxgeist"
+        self.config_file = self.config_dir / "config.yaml"
+        self.config = self._load_config()
+
+    def _load_config(self) -> Dict:
+        """Load configuration from YAML file, create if missing"""
+        config = {}
+
+        if self.config_file.exists():
+            try:
+                with open(self.config_file, "r") as f:
+                    config = yaml.safe_load(f) or {}
+                logger.info(f"Loaded config from {self.config_file}")
+            except Exception as e:
+                logger.warning(f"Failed to load config file: {e}")
+
+        # If no config file exists, create default one
+        if not config:
+            config = self._create_default_config()
+
+        return config
+
+    def _create_default_config(self) -> Dict:
+        """Create default configuration file"""
+        default_config = {
+            "ai": {
+                "provider": None,  # Will be auto-detected
+                "anthropic": {"api_key": None, "model": "claude-3-5-sonnet-20241022"},
+                "openai": {"api_key": None, "model": "gpt-4o"},
+                "openrouter": {"api_key": None, "model": "anthropic/claude-3.5-sonnet"},
+            },
+            "daemon": {"socket_path": "/tmp/muxgeist.sock"},
+            "ui": {"pane_size": "40", "pane_title": "muxgeist"},
+            "logging": {"level": "INFO"},
+        }
+
+        # Create config directory if it doesn't exist
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            with open(self.config_file, "w") as f:
+                yaml.dump(default_config, f, default_flow_style=False, indent=2)
+            logger.info(f"Created default config at {self.config_file}")
+        except Exception as e:
+            logger.warning(f"Failed to create config file: {e}")
+
+        return default_config
+
+    def get(self, key_path: str, default=None):
+        """Get configuration value with dot notation (e.g., 'ai.anthropic.api_key')"""
+        # First try environment variable
+        env_key = key_path.upper().replace(".", "_")
+        env_value = os.getenv(env_key)
+        if env_value is not None:
+            return env_value
+
+        # Then try config file
+        keys = key_path.split(".")
+        value = self.config
+
+        for key in keys:
+            if isinstance(value, dict) and key in value:
+                value = value[key]
+            else:
+                return default
+
+        return value
+
+    def get_api_key(self, provider: str) -> Optional[str]:
+        """Get API key for specific provider with environment fallback"""
+        # Check environment variables first (for backward compatibility)
+        env_keys = {
+            "anthropic": "ANTHROPIC_API_KEY",
+            "openai": "OPENAI_API_KEY",
+            "openrouter": "OPENROUTER_API_KEY",
+        }
+
+        if provider in env_keys:
+            env_key = os.getenv(env_keys[provider])
+            if env_key:
+                return env_key
+
+        # Then check config file
+        return self.get(f"ai.{provider}.api_key")
+
+    def get_model(self, provider: str) -> str:
+        """Get model for specific provider"""
+        # Check for provider-specific environment override
+        env_model = os.getenv(f"{provider.upper()}_MODEL")
+        if env_model:
+            return env_model
+
+        # Get from config with provider-specific default
+        defaults = {
+            "anthropic": "claude-3-5-sonnet-20241022",
+            "openai": "gpt-4o",
+            "openrouter": "anthropic/claude-3.5-sonnet",
+        }
+
+        return self.get(f"ai.{provider}.model", defaults.get(provider, "unknown"))
+
+
 class DaemonClient:
     """Client for communicating with muxgeist daemon"""
 
-    def __init__(self, socket_path: str = "/tmp/muxgeist.sock"):
-        self.socket_path = socket_path
+    def __init__(self, config_manager: ConfigManager = None):
+        self.config = config_manager or ConfigManager()
+        self.socket_path = self.config.get("daemon.socket_path", "/tmp/muxgeist.sock")
 
     def _send_command(self, command: str) -> str:
         """Send command to daemon and return response"""
@@ -263,32 +372,29 @@ class ContextAnalyzer:
 class AIClient:
     """Client for AI API interactions"""
 
-    def __init__(self, provider: str = "anthropic"):
+    def __init__(self, provider: str, config_manager: ConfigManager):
         self.provider = provider
+        self.config = config_manager
+
+        api_key = self.config.get_api_key(provider)
+        if not api_key:
+            raise ValueError(
+                f"{provider.upper()}_API_KEY not found in config or environment"
+            )
 
         if provider == "anthropic":
-            api_key = os.getenv("ANTHROPIC_API_KEY")
-            if not api_key:
-                raise ValueError("ANTHROPIC_API_KEY environment variable required")
             self.client = Anthropic(api_key=api_key)
-            self.model = "claude-3-5-sonnet-20241022"
+            self.model = self.config.get_model("anthropic")
 
         elif provider == "openai":
-            api_key = os.getenv("OPENAI_API_KEY")
-            if not api_key:
-                raise ValueError("OPENAI_API_KEY environment variable required")
             self.client = openai.OpenAI(api_key=api_key)
-            self.model = "gpt-4o"
+            self.model = self.config.get_model("openai")
 
         elif provider == "openrouter":
-            api_key = os.getenv("OPENROUTER_API_KEY")
-            if not api_key:
-                raise ValueError("OPENROUTER_API_KEY environment variable required")
             self.client = openai.OpenAI(
                 api_key=api_key, base_url="https://openrouter.ai/api/v1"
             )
-            # Default to a good model, but allow override via env var
-            self.model = os.getenv("OPENROUTER_MODEL", "anthropic/claude-3.5-sonnet")
+            self.model = self.config.get_model("openrouter")
 
         else:
             raise ValueError(
@@ -368,29 +474,30 @@ class MuxgeistAI:
     """Main AI service for Muxgeist"""
 
     def __init__(self, ai_provider: str = None):
-        self.daemon_client = DaemonClient()
+        self.config = ConfigManager()
+        self.daemon_client = DaemonClient(self.config)
         self.context_analyzer = ContextAnalyzer()
 
         # Auto-detect provider if not specified
         if ai_provider is None:
             ai_provider = self._detect_provider()
 
-        self.ai_client = AIClient(ai_provider)
+        self.ai_client = AIClient(ai_provider, self.config)
         logger.info(
             f"Initialized with {ai_provider} provider using model: {self.ai_client.model}"
         )
 
     def _detect_provider(self) -> str:
         """Auto-detect available AI provider"""
-        if os.getenv("ANTHROPIC_API_KEY"):
-            return "anthropic"
-        elif os.getenv("OPENROUTER_API_KEY"):
-            return "openrouter"
-        elif os.getenv("OPENAI_API_KEY"):
-            return "openai"
-        else:
-            # Default to anthropic, will fail gracefully if no key
-            return "anthropic"
+        # Check config file first, then environment variables
+        providers = ["anthropic", "openai", "openrouter"]
+
+        for provider in providers:
+            if self.config.get_api_key(provider):
+                return provider
+
+        # Default to anthropic, will fail gracefully if no key
+        return "anthropic"
 
     def analyze_session(self, session_id: str) -> Optional[AnalysisResult]:
         """Perform complete analysis of a session"""
@@ -464,6 +571,7 @@ def main():
             "       python3 muxgeist_ai.py --list [--provider anthropic|openai|openrouter]"
         )
         print("       python3 muxgeist_ai.py --providers")
+        print("       python3 muxgeist_ai.py --config")
         sys.exit(1)
 
     # Parse arguments
@@ -478,23 +586,36 @@ def main():
 
     try:
         # Handle special commands
+        if sys.argv[1] == "--config":
+            config = ConfigManager()
+            print(f"Configuration file: {config.config_file}")
+            print(f"Config directory: {config.config_dir}")
+            if config.config_file.exists():
+                print("✓ Config file exists")
+            else:
+                print("⚠ Config file not found, will be created")
+
+            # Show current configuration
+            print("\nCurrent configuration:")
+            for provider_name in ["anthropic", "openai", "openrouter"]:
+                api_key = config.get_api_key(provider_name)
+                if api_key:
+                    print(f"  ✓ {provider_name}: API key configured")
+                else:
+                    print(f"  ✗ {provider_name}: No API key")
+            return
+
         if sys.argv[1] == "--providers":
+            config = ConfigManager()
             print("Available AI providers:")
             providers = []
-            if os.getenv("ANTHROPIC_API_KEY"):
-                providers.append("✓ anthropic (Claude)")
-            else:
-                providers.append("✗ anthropic (missing ANTHROPIC_API_KEY)")
 
-            if os.getenv("OPENAI_API_KEY"):
-                providers.append("✓ openai (GPT)")
-            else:
-                providers.append("✗ openai (missing OPENAI_API_KEY)")
-
-            if os.getenv("OPENROUTER_API_KEY"):
-                providers.append("✓ openrouter (Multiple models)")
-            else:
-                providers.append("✗ openrouter (missing OPENROUTER_API_KEY)")
+            for provider_name in ["anthropic", "openai", "openrouter"]:
+                api_key = config.get_api_key(provider_name)
+                if api_key:
+                    providers.append(f"✓ {provider_name}")
+                else:
+                    providers.append(f"✗ {provider_name} (no API key)")
 
             for p in providers:
                 print(f"  {p}")
@@ -527,11 +648,13 @@ def main():
 
         # Provide helpful hints for common errors
         if "API key" in str(e):
-            print("\n💡 Tip: Set your API key:")
-            print("  export ANTHROPIC_API_KEY='your-key'")
-            print("  export OPENAI_API_KEY='your-key'")
-            print("  export OPENROUTER_API_KEY='your-key'")
-            print("\nOr check available providers with: --providers")
+            print("\n💡 Configuration help:")
+            print(f"  Edit config file: nvim ~/.config/muxgeist/config.yaml")
+            print("  Or set environment variables:")
+            print("    export ANTHROPIC_API_KEY='your-key'")
+            print("    export OPENAI_API_KEY='your-key'")
+            print("    export OPENROUTER_API_KEY='your-key'")
+            print("\nCheck config with: python3 muxgeist_ai.py --config")
 
         sys.exit(1)
 

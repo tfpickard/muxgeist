@@ -1,24 +1,48 @@
-#!/usr/bin/env python3
-
 import os
 import sys
 import time
 import signal
 import subprocess
 import threading
+import traceback
 from datetime import datetime
 from pathlib import Path
 
 # Add current directory to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from muxgeist_ai import MuxgeistAI, DaemonClient
+# Set up logging to file for debugging
+import logging
+
+log_file = Path.home() / ".config" / "muxgeist" / "interactive.log"
+log_file.parent.mkdir(parents=True, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.FileHandler(log_file), logging.StreamHandler(sys.stderr)],
+)
+logger = logging.getLogger(__name__)
+
+logger.info("Starting muxgeist-interactive.py")
+
+try:
+    from muxgeist_ai import MuxgeistAI, DaemonClient
+
+    logger.info("Successfully imported muxgeist_ai modules")
+except ImportError as e:
+    logger.error(f"Failed to import muxgeist_ai: {e}")
+    print(f"❌ Import error: {e}")
+    print("Make sure you're in the muxgeist directory and dependencies are installed")
+    print(f"Log file: {log_file}")
+    sys.exit(1)
 
 
 class MuxgeistInteractive:
     """Interactive Muxgeist interface for tmux pane"""
 
     def __init__(self):
+        logger.info("Initializing MuxgeistInteractive")
         self.running = True
         self.session_name = None
         self.ai_service = None
@@ -37,6 +61,7 @@ class MuxgeistInteractive:
 
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals"""
+        logger.info(f"Received signal {signum}")
         self.running = False
         print("\n👋 Muxgeist signing off...")
         sys.exit(0)
@@ -51,16 +76,25 @@ class MuxgeistInteractive:
             )
             if result.returncode == 0:
                 self.session_name = result.stdout.strip()
+                logger.info(f"Detected tmux session: {self.session_name}")
             else:
                 self.session_name = "unknown"
-        except Exception:
+                logger.warning(f"Failed to detect session: {result.stderr}")
+        except Exception as e:
             self.session_name = "unknown"
+            logger.error(f"Exception detecting session: {e}")
 
     def _init_ai_service(self):
         """Initialize AI service with error handling"""
         try:
+            logger.info("Initializing AI service...")
             self.ai_service = MuxgeistAI()
+            logger.info(
+                f"AI service initialized with provider: {self.ai_service.ai_client.provider}"
+            )
         except Exception as e:
+            logger.error(f"Failed to initialize AI service: {e}")
+            logger.error(f"Exception details: {traceback.format_exc()}")
             print(f"⚠️  AI service unavailable: {e}")
             self.ai_service = None
 
@@ -102,17 +136,22 @@ class MuxgeistInteractive:
             return "AI service not available"
 
         try:
+            logger.info(f"Analyzing session: {self.session_name}")
             print("🔍 Analyzing your session...")
             result = self.ai_service.analyze_session(self.session_name)
 
             if result:
                 self.last_analysis = result
                 self.analysis_time = datetime.now()
+                logger.info("Analysis completed successfully")
                 return result.analysis
             else:
+                logger.warning("Analysis returned no result")
                 return "Could not analyze session - no context available"
 
         except Exception as e:
+            logger.error(f"Analysis failed: {e}")
+            logger.error(f"Exception details: {traceback.format_exc()}")
             return f"Analysis failed: {e}"
 
     def _show_analysis(self):
@@ -131,6 +170,9 @@ class MuxgeistInteractive:
         )
 
         print(f"📊 Analysis Results (updated {age_mins}m ago):")
+        print(
+            f"🎯 Analyzing pane {result.session_context.pane} in session '{result.session_context.session_id}'"
+        )
         print("─" * 50)
         print(result.analysis)
 
@@ -143,9 +185,10 @@ class MuxgeistInteractive:
         if result.requires_attention:
             print("⚠️  Requires attention")
 
-        print(
-            f"🤖 Provider: {self.ai_service.ai_client.provider} ({self.ai_service.ai_client.model})"
-        )
+        if self.ai_service:
+            print(
+                f"🤖 Provider: {self.ai_service.ai_client.provider} ({self.ai_service.ai_client.model})"
+            )
 
     def _show_help(self):
         """Show help information"""
@@ -156,6 +199,7 @@ class MuxgeistInteractive:
         print("  s, status   - Show daemon status")
         print("  l, list     - List all sessions")
         print("  h, help     - Show this help")
+        print("  d, debug    - Show debug information")
         print("  q, quit     - Dismiss Muxgeist")
         print("  <Enter>     - Re-analyze session")
         print()
@@ -193,6 +237,27 @@ class MuxgeistInteractive:
         else:
             print("🔍 No analysis yet")
 
+    def _show_debug(self):
+        """Show debug information"""
+        print("🐛 Debug Information:")
+        print("─" * 25)
+        print(f"Log file: {log_file}")
+        print(f"Python path: {sys.path[0]}")
+        print(f"Working directory: {os.getcwd()}")
+        print(f"TMUX: {os.environ.get('TMUX', 'Not set')}")
+
+        if self.ai_service:
+            print(f"AI Provider: {self.ai_service.ai_client.provider}")
+            print(f"AI Model: {self.ai_service.ai_client.model}")
+
+        # Test daemon connection
+        try:
+            client = DaemonClient()
+            sessions = client.list_sessions()
+            print(f"Daemon sessions: {len(sessions)}")
+        except Exception as e:
+            print(f"Daemon error: {e}")
+
     def _list_sessions(self):
         """List all tracked sessions"""
         if not self.ai_service:
@@ -205,6 +270,7 @@ class MuxgeistInteractive:
             print("─" * 20)
             print(summary)
         except Exception as e:
+            logger.error(f"Failed to list sessions: {e}")
             print(f"Failed to list sessions: {e}")
 
     def _handle_question(self, question):
@@ -233,6 +299,8 @@ class MuxgeistInteractive:
 
     def _process_command(self, cmd):
         """Process user command"""
+        logger.debug(f"Processing command: {cmd}")
+
         if cmd in ("q", "quit", "exit"):
             return False
         elif cmd in ("a", "analyze", ""):
@@ -246,6 +314,8 @@ class MuxgeistInteractive:
             self._list_sessions()
         elif cmd in ("h", "help"):
             self._show_help()
+        elif cmd in ("d", "debug"):
+            self._show_debug()
         elif cmd.startswith("?") or len(cmd) > 10:  # Treat longer input as questions
             self._handle_question(cmd)
         else:
@@ -256,47 +326,66 @@ class MuxgeistInteractive:
 
     def run(self):
         """Main interactive loop"""
-        self._clear_screen()
-        self._format_header()
+        logger.info("Starting interactive loop")
 
-        print("👋 Welcome! I'm analyzing your session...")
-        print()
+        try:
+            self._clear_screen()
+            self._format_header()
 
-        # Initial analysis
-        self._show_analysis()
+            print("👋 Welcome! I'm analyzing your session...")
+            print()
 
-        # Interactive loop
-        while self.running:
-            try:
-                cmd = self._get_user_input()
+            # Initial analysis
+            self._show_analysis()
 
-                if not self._process_command(cmd):
-                    break
+            # Interactive loop
+            while self.running:
+                try:
+                    cmd = self._get_user_input()
 
-            except Exception as e:
-                print(f"Error: {e}")
-                continue
+                    if not self._process_command(cmd):
+                        break
+
+                except Exception as e:
+                    logger.error(f"Error processing command: {e}")
+                    print(f"Error: {e}")
+                    continue
+
+        except Exception as e:
+            logger.error(f"Fatal error in run loop: {e}")
+            logger.error(f"Exception details: {traceback.format_exc()}")
+            print(f"❌ Fatal error: {e}")
+            print(f"Check log file: {log_file}")
 
         # Clean exit
+        logger.info("Exiting interactive mode")
         print("\n👋 Muxgeist dismissed. Use Ctrl+G to summon again!")
 
 
 def main():
     """Entry point for interactive mode"""
 
+    logger.info("Starting muxgeist-interactive main()")
+
     # Check if we're in tmux
     if not os.environ.get("TMUX"):
-        print("❌ Muxgeist must run inside tmux")
+        error_msg = "❌ Muxgeist must run inside tmux"
+        logger.error(error_msg)
+        print(error_msg)
         print("Start tmux first: tmux new-session")
         sys.exit(1)
 
     # Check if daemon is running
     try:
         client = DaemonClient()
-        client.get_status()
-    except Exception:
-        print("❌ Muxgeist daemon not running")
+        status = client.get_status()
+        logger.info(f"Daemon status: {status}")
+    except Exception as e:
+        error_msg = f"❌ Muxgeist daemon not running: {e}"
+        logger.error(error_msg)
+        print(error_msg)
         print("Start daemon: ./muxgeist-daemon &")
+        print(f"Debug log: {log_file}")
         sys.exit(1)
 
     # Run interactive interface
@@ -304,9 +393,13 @@ def main():
         interface = MuxgeistInteractive()
         interface.run()
     except KeyboardInterrupt:
+        logger.info("Interrupted by user")
         print("\n👋 Goodbye!")
     except Exception as e:
+        logger.error(f"Fatal error in main: {e}")
+        logger.error(f"Exception details: {traceback.format_exc()}")
         print(f"❌ Error: {e}")
+        print(f"Check log file: {log_file}")
         sys.exit(1)
 
 
