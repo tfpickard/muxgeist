@@ -272,20 +272,62 @@ class ContextAnalyzer:
             (r"tmux", "terminal multiplexing"),
         ]
 
+    def parse_multi_pane_scrollback(self, scrollback: str) -> Dict[str, str]:
+        """Parse multi-pane scrollback into individual pane contents"""
+        panes = {}
+
+        if "=== PANE" not in scrollback:
+            # Single pane format
+            panes["main"] = scrollback
+            return panes
+
+        # Split by pane headers
+        sections = scrollback.split("=== PANE ")
+        for section in sections[1:]:  # Skip first empty section
+            lines = section.split("\n", 1)
+            if len(lines) >= 2:
+                # Extract pane ID and title from header like "2.1 (belzebu) ==="
+                header = lines[0].split(" ===")[0]
+                pane_content = lines[1] if len(lines) > 1 else ""
+
+                # Clean up header to get pane info
+                pane_info = header.strip("()").replace("(", " - ")
+                panes[pane_info] = pane_content
+
+        return panes
+
     def analyze_scrollback(self, scrollback: str) -> Dict[str, any]:
         """Analyze scrollback content for patterns and context"""
+
         analysis = {
             "errors_found": [],
             "tools_detected": [],
             "recent_commands": [],
             "working_on": "unknown",
             "sentiment": "neutral",
+            "panes_analyzed": [],
+            "primary_activity": "unknown",
         }
-
         if not scrollback:
             return analysis
 
-        lines = scrollback.split("\n")
+        # Parse multi-pane content
+        panes = self.parse_multi_pane_scrollback(scrollback)
+        analysis["panes_analyzed"] = list(panes.keys())
+
+        # Analyze each pane
+        all_lines = []
+        for pane_id, pane_content in panes.items():
+            lines = pane_content.split("\n")
+            all_lines.extend(lines)
+
+            # Track which pane has the most activity
+            if len(lines) > 10:  # Significant content
+                analysis["primary_activity"] = pane_id
+
+        # Use recent lines from all panes for analysis
+        lines = all_lines
+        # lines = scrollback.split("\n")
         recent_lines = lines[-50:]  # Look at last 50 lines
 
         # Detect errors
