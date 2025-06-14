@@ -252,7 +252,7 @@ class DaemonClient:
 class ContextAnalyzer:
     """Analyzes terminal context to extract meaningful information"""
 
-    def __init__(self):
+        def __init__(self):
         self.error_patterns = [
             (r"error:", "compilation or runtime error"),
             (r"permission denied", "permission issue"),
@@ -272,6 +272,41 @@ class ContextAnalyzer:
             (r"tmux", "terminal multiplexing"),
         ]
 
+    def parse_multi_pane_scrollback(self, scrollback: str) -> Dict[str, str]:
+        """Parse multi-pane scrollback into individual pane contents"""
+        panes = {}
+        
+        if "=== PANE" not in scrollback:
+            # Single pane format
+            panes["main"] = scrollback
+            return panes
+        
+        # Split by pane headers
+        sections = scrollback.split("=== PANE ")
+        for section in sections[1:]:  # Skip first empty section
+            lines = section.split("\n", 1)
+            if len(lines) >= 2:
+                # Extract pane ID and title from header like "0.0 (shell) ==="
+                header = lines[0].split(" ===")[0]
+                pane_content = lines[1] if len(lines) > 1 else ""
+                
+                # Clean up header to get pane info
+                pane_info = header.strip("()").replace("(", " - ")
+                panes[pane_info] = pane_content
+        
+        return panes
+
+
+        self.tool_patterns = [
+            (r"gcc|clang", "c compilation"),
+            (r"python|pip", "python development"),
+            (r"git", "version control"),
+            (r"make|cmake", "build system"),
+            (r"gdb|valgrind", "debugging"),
+            (r"nvim|vim", "text editing"),
+            (r"tmux", "terminal multiplexing"),
+        ]
+
     def analyze_scrollback(self, scrollback: str) -> Dict[str, any]:
         """Analyze scrollback content for patterns and context"""
         analysis = {
@@ -280,13 +315,29 @@ class ContextAnalyzer:
             "recent_commands": [],
             "working_on": "unknown",
             "sentiment": "neutral",
+            "panes_analyzed": [],
+            "primary_activity": "unknown",
         }
 
         if not scrollback:
             return analysis
 
-        lines = scrollback.split("\n")
-        recent_lines = lines[-50:]  # Look at last 50 lines
+        # Parse multi-pane content
+        panes = self.parse_multi_pane_scrollback(scrollback)
+        analysis["panes_analyzed"] = list(panes.keys())
+
+        # Analyze each pane
+        all_lines = []
+        for pane_id, pane_content in panes.items():
+            lines = pane_content.split("\n")
+            all_lines.extend(lines)
+            
+            # Track which pane has the most activity
+            if len(lines) > 10:  # Significant content
+                analysis["primary_activity"] = pane_id
+
+        # Use recent lines from all panes for analysis
+        recent_lines = all_lines[-100:]  # Increased for multi-pane
 
         # Detect errors
         for line in recent_lines:
@@ -321,6 +372,10 @@ class ContextAnalyzer:
             analysis["working_on"] = "debugging session"
         elif "build system" in analysis["tools_detected"]:
             analysis["working_on"] = "building project"
+
+                # Enhanced working context for multi-pane
+        if len(panes) > 1:
+            analysis["working_on"] += f" (across {len(panes)} panes)"
 
         # Simple sentiment analysis
         if analysis["errors_found"]:
@@ -443,6 +498,15 @@ class AIClient:
     ) -> str:
         """Build prompt for AI analysis"""
 
+                # Get pane information
+        panes_info = ""
+        if "panes_analyzed" in scrollback_analysis:
+            panes = scrollback_analysis["panes_analyzed"]
+            if len(panes) > 1:
+                panes_info = f"- Active Panes: {', '.join(panes)}\n"
+                if "primary_activity" in scrollback_analysis:
+                    panes_info += f"- Primary Activity Pane: {scrollback_analysis['primary_activity']}\n"
+
         prompt = f"""You are Muxgeist, a helpful AI assistant that lives in a terminal environment. 
 Analyze this tmux session context and provide insights and suggestions.
 
@@ -452,6 +516,7 @@ CONTEXT:
 - Project Type: {project_analysis.get('project_type', 'unknown')}
 - Working On: {scrollback_analysis.get('working_on', 'unknown')}
 - User Sentiment: {scrollback_analysis.get('sentiment', 'neutral')}
+{panes_info}
 
 RECENT ACTIVITY:
 - Tools Detected: {', '.join(scrollback_analysis.get('tools_detected', []))}
@@ -466,6 +531,7 @@ Please provide:
 3. Any potential issues or improvements
 
 Keep responses concise and terminal-friendly. Focus on being helpful, not verbose.
+If analyzing multiple panes, provide context-aware suggestions that consider the user's multi-tasking workflow.
 """
         return prompt
 

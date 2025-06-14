@@ -15,7 +15,7 @@
 
 #define MUXGEIST_SOCKET_PATH "/tmp/muxgeist.sock"
 #define MAX_SESSIONS 32
-#define MAX_BUFFER_SIZE 8192
+#define MAX_BUFFER_SIZE 16384 // Increased for multi-pane content
 #define MAX_COMMAND_SIZE 512
 #define CONTEXT_HISTORY_SIZE 100
 
@@ -104,14 +104,21 @@ muxgeist_error_t execute_tmux_command(const char *cmd, char *output,
     return ERROR_TMUX_CMD;
   }
 
-  if (fgets(output, output_size, fp) == NULL) {
-    output[0] = '\0';
+  // Read all output, not just first line
+  size_t total_read = 0;
+  while (total_read < output_size - 1) {
+    size_t bytes_read =
+        fread(output + total_read, 1, output_size - total_read - 1, fp);
+    if (bytes_read == 0)
+      break;
+    total_read += bytes_read;
   }
 
-  // Remove trailing newline
-  size_t len = strlen(output);
-  if (len > 0 && output[len - 1] == '\n') {
-    output[len - 1] = '\0';
+  output[total_read] = '\0';
+
+  // Remove trailing newline if present
+  if (total_read > 0 && output[total_read - 1] == '\n') {
+    output[total_read - 1] = '\0';
   }
 
   pclose(fp);
@@ -142,6 +149,135 @@ session_context_t *create_session(const char *session_id) {
   return session;
 }
 
+muxgeist_error_t capture_all_panes(session_context_t *session) {
+  char cmd[512];
+  char pane_list[2048];
+  char temp_content[MAX_BUFFER_SIZE];
+
+  // Clear existing scrollback
+  session->scrollback[0] = '\0';
+  session->scrollback_len = 0;
+
+  // Get list of all panes in the session
+  snprintf(
+      cmd, sizeof(cmd),
+      "tmux list-panes -t %s -F "
+      "'#{window_index}.#{pane_index}:#{pane_title}:#{pane_current_command}'",
+      session->session_id);
+
+  if (execute_tmux_command(cmd, pane_list, sizeof(pane_list)) != ERROR_NONE) {
+    return ERROR_TMUX_CMD;
+  }
+
+  // If no panes found, try to get content anyway
+  if (strlen(pane_list) == 0) {
+    snprintf(cmd, sizeof(cmd), "tmux capture-pane -t %s -p",
+             session->session_id);
+    FILE *fp = popen(cmd, "r");
+    if (fp) {
+      session->scrollback_len =
+          fread(session->scrollback, 1, sizeof(session->scrollback) - 1, fp);
+      session->scrollback[session->scrollback_len] = '\0';
+      pclose(fp);
+    }
+    return ERROR_NONE;
+  }
+
+  // Process each pane
+  char *line = strtok(pane_list, "\n");
+  int pane_count = 0;
+
+  while (line != NULL &&
+         session->scrollback_len < sizeof(session->scrollback) - 500) {
+    char pane_id[32];
+    char pane_title[64] = "shell";
+    char pane_command[64] = "";
+
+    // Parse pane info: "window.pane:title:command"
+    char *colon1 = strchr(line, ':');
+    if (colon1) {
+      *colon1 = '\0';
+      strncpy(pane_id, line, sizeof(pane_id) - 1);
+      pane_id[sizeof(pane_id) - 1] = '\0';
+
+      char *colon2 = strchr(colon1 + 1, ':');
+      if (colon2) {
+        *colon2 = '\0';
+        strncpy(pane_title, colon1 + 1, sizeof(pane_title) - 1);
+        strncpy(pane_command, colon2 + 1, sizeof(pane_command) - 1);
+      } else {
+        strncpy(pane_title, colon1 + 1, sizeof(pane_title) - 1);
+      }
+    } else {
+      strncpy(pane_id, line, sizeof(pane_id) - 1);
+    }
+
+    // Skip the muxgeist pane itself
+    if (strstr(pane_title, "muxgeist") != NULL) {
+      line = strtok(NULL, "\n");
+      continue;
+    }
+
+    // Capture this pane's content
+    snprintf(cmd, sizeof(cmd), "tmux capture-pane -t %s:%s -p",
+             session->session_id, pane_id);
+
+    FILE *fp = popen(cmd, "r");
+    if (fp) {
+      size_t content_len = fread(temp_content, 1, sizeof(temp_content) - 1, fp);
+      temp_content[content_len] = '\0';
+      pclose(fp);
+
+      // Only include panes with meaningful content (skip empty/minimal panes)
+      if (content_len > 10) {
+        // Add pane header
+        int header_len =
+            snprintf(session->scrollback + session->scrollback_len,
+                     sizeof(session->scrollback) - session->scrollback_len,
+                     "\n=== PANE %s (%s) ===\n", pane_id, pane_title);
+
+        if (header_len > 0 && session->scrollback_len + header_len <
+                                  sizeof(session->scrollback)) {
+          session->scrollback_len += header_len;
+        }
+
+        // Add pane content (limit to avoid overflow)
+        size_t available_space =
+            sizeof(session->scrollback) - session->scrollback_len - 1;
+        size_t copy_len =
+            (content_len < available_space) ? content_len : available_space;
+
+        if (copy_len > 0) {
+          memcpy(session->scrollback + session->scrollback_len, temp_content,
+                 copy_len);
+          session->scrollback_len += copy_len;
+          session->scrollback[session->scrollback_len] = '\0';
+        }
+
+        pane_count++;
+      }
+    }
+
+    line = strtok(NULL, "\n");
+  }
+
+  // If we didn't capture any panes (all were empty/muxgeist), capture the
+  // active pane
+  if (pane_count == 0) {
+    snprintf(cmd, sizeof(cmd), "tmux capture-pane -t %s -p",
+             session->session_id);
+    FILE *fp = popen(cmd, "r");
+    if (fp) {
+      session->scrollback_len =
+          fread(session->scrollback, 1, sizeof(session->scrollback) - 1, fp);
+      session->scrollback[session->scrollback_len] = '\0';
+      pclose(fp);
+    }
+  }
+
+  return ERROR_NONE;
+}
+
 muxgeist_error_t update_session_context(session_context_t *session) {
   char cmd[256];
   char output[MAX_BUFFER_SIZE];
@@ -155,7 +291,7 @@ muxgeist_error_t update_session_context(session_context_t *session) {
     strncpy(session->current_pane, output, sizeof(session->current_pane) - 1);
   }
 
-  // Get current working directory
+  // Get current working directory from active pane
   snprintf(cmd, sizeof(cmd),
            "tmux display-message -t %s -p '#{pane_current_path}'",
            session->session_id);
@@ -164,18 +300,11 @@ muxgeist_error_t update_session_context(session_context_t *session) {
     strncpy(session->current_cwd, output, sizeof(session->current_cwd) - 1);
   }
 
-  // Capture scrollback
-  snprintf(cmd, sizeof(cmd), "tmux capture-pane -t %s -p", session->session_id);
-  FILE *fp = popen(cmd, "r");
-  if (fp) {
-    session->scrollback_len =
-        fread(session->scrollback, 1, sizeof(session->scrollback) - 1, fp);
-    session->scrollback[session->scrollback_len] = '\0';
-    pclose(fp);
-  }
+  // Capture content from all panes
+  rc = capture_all_panes(session);
 
   session->last_activity = time(NULL);
-  return ERROR_NONE;
+  return rc;
 }
 
 muxgeist_error_t scan_tmux_sessions(void) {
@@ -232,9 +361,10 @@ void handle_client_request(int client_socket) {
     if (session) {
       snprintf(response, sizeof(response),
                "Session: %s\nCWD: %s\nPane: %s\nLast Activity: %ld\nScrollback "
-               "Length: %d\n",
+               "Length: %d\nScrollback:\n%s\n",
                session->session_id, session->current_cwd, session->current_pane,
-               session->last_activity, session->scrollback_len);
+               session->last_activity, session->scrollback_len,
+               session->scrollback);
     } else {
       snprintf(response, sizeof(response), "ERROR: Session not found");
     }
