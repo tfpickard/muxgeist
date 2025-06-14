@@ -1,0 +1,21 @@
+ai:
+  provider: null # Will be auto-detected
+  anthropic:
+    api_key: null # Set your API key here
+    model: "claude-3-5-sonnet-20241022"
+  openai:
+    api_key: null
+    model: "gpt-4o"
+  openrouter:
+    api_key: null
+    model: "anthropic/claude-3.5-sonnet"
+
+daemon:
+  socket_path: "/tmp/muxgeist.sock"
+
+ui:
+  pane_size: "40"
+  pane_title: "muxgeist"
+
+logging:
+  level: "INFO"
