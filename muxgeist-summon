@@ -11,12 +11,12 @@ MUXGEIST_SIZE="40" # Percentage of screen width
 
 # Try to find the interactive script in several locations
 SCRIPT_LOCATIONS=(
-    "$(dirname "$0")/muxgeist-interactive" # Wrapper script (preferred)
-    "$(which muxgeist-interactive 2>/dev/null || true)"
-    "$(dirname "$0")/muxgeist-interactive.py" # Direct Python script
-    "$HOME/.local/bin/muxgeist-interactive"
-    "$HOME/.local/bin/muxgeist-interactive.py"
-    "./muxgeist-interactive.py"
+    # "$(dirname "$0")/muxgeist-interactive" # Wrapper script (preferred)
+    # "$(which muxgeist-interactive 2>/dev/null || true)"
+    # "$(dirname "$0")/muxgeist-interactive.py" # Direct Python script
+    # "$HOME/.local/bin/muxgeist-interactive"
+    # "$HOME/.local/bin/muxgeist-interactive.py"
+    "$HOME/src/muxgeist/muxgeist-interactive.py"
 )
 
 MUXGEIST_SCRIPT_PATH=""
